@@ -1,6 +1,18 @@
 #include <pthread.h>
 #include"spinlock.h"
 
+
+
+//data structures 
+struct maple_tree {
+	union {
+		// locks
+		spinlock ma_lock;
+	};
+	void       *ma_root;
+	unsigned int	ma_flags;
+};
+
 /*
 Start by initialising a maple tree
 DEFINE_MTREE() for statically allocated maple trees 
@@ -43,12 +55,12 @@ If the maple tree entries are pointers, free the entries first.
 	struct maple_tree name = MTREE_INIT(name, 0)
 
 #define MTREE_INIT(name, __flags) {					\
-	.ma_lock = __SPIN_LOCK_UNLOCKED((name).ma_lock),		\
+	.ma_lock = SPINLOCK_INITIALIZER,		\
 	.ma_flags = __flags,						\
 	.ma_root = NULL,						\
 }
-
-static inline void mt_init(struct maple_tree *mt){}
+static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags);
+static inline void mt_init(struct maple_tree *mt);
 
 
 
@@ -60,7 +72,6 @@ static inline void mt_init(struct maple_tree *mt){}
 //  * mt_next()
 //  * mt_prev()
 
-struct maple_tree {};
 void *mtree_load(struct maple_tree *mt, unsigned long index);
 void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max);
 #define mt_for_each(__tree, __entry, __index, __max) \
