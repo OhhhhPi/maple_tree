@@ -1,7 +1,19 @@
 #include <pthread.h>
 #include"spinlock.h"
+#include <urcu.h>
 
-
+// macro
+#define MA_STATE(name, mt, first, end)					\
+	struct ma_state name = {					\
+		.tree = mt,						\
+		.index = first,						\
+		.last = end,						\
+		.node = MAS_START,					\
+		.min = 0,						\
+		.max = ULONG_MAX,					\
+		.alloc = NULL,						\
+		.mas_flags = 0,						\
+	}
 
 //data structures 
 struct maple_tree {
@@ -11,7 +23,59 @@ struct maple_tree {
 	};
 	void       *ma_root;
 	unsigned int	ma_flags;
+
 };
+
+struct ma_state {
+	struct maple_tree *tree;	/* The tree we're operating in */
+	unsigned long index;		/* The index we're operating on - range start */
+	unsigned long last;		/* The last index we're operating on - range end */
+	struct maple_enode *node;	/* The node containing this entry */
+	unsigned long min;		/* The minimum index of this node - implied pivot min */
+	unsigned long max;		/* The maximum index of this node - implied pivot max */
+	struct maple_alloc *alloc;	/* Allocated nodes for this operation */
+	unsigned char depth;		/* depth of tree descent during write */
+	unsigned char offset;
+	unsigned char mas_flags;
+};
+
+/*
+ * The Maple Tree squeezes various bits in at various points which aren't
+ * necessarily obvious.  Usually, this is done by observing that pointers are
+ * N-byte aligned and thus the bottom log_2(N) bits are available for use.  We
+ * don't use the high bits of pointers to store additional information because
+ * we don't know what bits are unused on any given architecture.
+ *
+ * Nodes are 256 bytes in size and are also aligned to 256 bytes, giving us 8
+ * low bits for our own purposes.  Nodes are currently of 4 types:
+ * 1. Single pointer (Range is 0-0)
+ * 2. Non-leaf Allocation Range nodes
+ * 3. Non-leaf Range nodes
+ * 4. Leaf Range nodes All nodes consist of a number of node slots,
+ *    pivots, and a parent pointer.
+ */
+
+struct maple_node {
+	union {
+		struct {
+			struct maple_pnode *parent;
+			void __rcu *slot[MAPLE_NODE_SLOTS];
+		};
+		struct {
+			void *pad;
+			struct rcu_head rcu;
+			struct maple_enode *piv_parent;
+			unsigned char parent_slot;
+			enum maple_type type;
+			unsigned char slot_len;
+			unsigned int ma_flags;
+		};
+		struct maple_range_64 mr64;
+		struct maple_arange_64 ma64;
+		struct maple_alloc alloc;
+	};
+};
+
 
 /*
 Start by initialising a maple tree
@@ -25,7 +89,8 @@ The allocation tree has a lower branching factor
 but allows the user to search for a gap of a given size or larger from either ``0`` upwards or ``ULONG_MAX`` down.
 An allocation tree can be used by passing in the ``MT_FLAGS_ALLOC_RANGE`` flag when initialising the tree.
 
-set entries using mtree_store() or mtree_store_range().
+mtree_store() 
+mtree_store_range() set entries
 mtree_store() will overwrite any entry with the new entry and return 0 on success or an error code otherwise.  
 mtree_store_range() works in the same way but takes a range.  
 mtree_load() is used to retrieve the entry stored at a given index. 
