@@ -16,12 +16,13 @@ int mtree_store(struct maple_tree *mt, unsigned long index, void *entry)
 {
 	return mtree_store_range(mt, index, index, entry);
 }
-int mtree_store_range(struct maple_tree *mt, unsigned long first, unsigned long last, void *entry){
-	// MA_STATE(mas, mt, index, last);
+int mtree_store_range(struct maple_tree *mt, unsigned long index, unsigned long last, void *entry){
+	// initialize ma_state
 	MA_STATE(mas,mt,index,last);
+	// initialize ma_wr_state
 	MA_WR_STATE(wr_mas, &mas, entry);
 
-	trace_ma_write(__func__, &mas, 0, entry);
+	// trace_ma_write(__func__, &mas, 0, entry);
 	if (WARN_ON_ONCE(xa_is_advanced(entry)))
 		return -EINVAL;
 
