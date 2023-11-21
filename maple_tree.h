@@ -2,6 +2,7 @@
 #include "spinlock.h"
 #include <urcu.h>
 #include <limits.h>
+#include <errno.h>
 
 // macro
 
@@ -289,9 +290,6 @@ int mtree_insert_range(struct maple_tree *mt, unsigned long first,
 		       unsigned long last, void *entry);
 void *mtree_erase(struct maple_tree *mt, unsigned long index);
 void mtree_destroy(struct maple_tree *mt);
-static inline void mt_set_in_rcu(struct maple_tree *mt)
-{
-}
-static inline void mt_clear_in_rcu(struct maple_tree *mt)
-{
-}
+static inline void mt_set_in_rcu(struct maple_tree *mt);
+static inline void mt_clear_in_rcu(struct maple_tree *mt);
+static inline void *mas_wr_store_entry(struct ma_wr_state *wr_mas);
