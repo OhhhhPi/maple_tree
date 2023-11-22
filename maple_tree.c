@@ -137,3 +137,26 @@ retry:
 
 	return NULL;
 }
+
+static inline bool mas_is_start(const struct ma_state *mas)
+{
+	return mas->node == MAS_START;
+}
+
+/*
+ * mas_root() - Get the maple tree root.
+ * @mas: The maple state.
+ *
+ * Return: The pointer to the root of the tree
+ */
+static inline void *mas_root(struct ma_state *mas)
+{
+	if(mt_locked(mas->tree)){
+		return rcu_dereference(mas->tree->ma_root);
+	}
+	// return rcu_dereference_check(mas->tree->ma_root, mt_locked(mas->tree));
+}
+static inline bool mt_locked(const struct maple_tree *mt)
+{
+	return lockdep_is_held(&mt->ma_lock);
+}

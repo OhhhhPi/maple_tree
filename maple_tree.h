@@ -6,6 +6,9 @@
 
 // macro
 
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
 #define MAS_START ((struct maple_enode *)1UL) // we have not searched the tree
 #define MAS_ROOT             \
 	((struct maple_enode \
@@ -293,3 +296,7 @@ void mtree_destroy(struct maple_tree *mt);
 static inline void mt_set_in_rcu(struct maple_tree *mt);
 static inline void mt_clear_in_rcu(struct maple_tree *mt);
 static inline void *mas_wr_store_entry(struct ma_wr_state *wr_mas);
+static inline struct maple_enode *mas_start(struct ma_state *mas);
+static inline bool mas_is_start(const struct ma_state *mas);
+static inline void *mas_root(struct ma_state *mas);
+static inline bool mt_locked(const struct maple_tree *mt);
