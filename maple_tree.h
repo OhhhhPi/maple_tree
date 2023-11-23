@@ -300,3 +300,8 @@ static inline struct maple_enode *mas_start(struct ma_state *mas);
 static inline bool mas_is_start(const struct ma_state *mas);
 static inline void *mas_root(struct ma_state *mas);
 static inline bool mt_locked(const struct maple_tree *mt);
+static inline bool mas_is_none(const struct ma_state *mas);
+static inline bool mas_is_ptr(const struct ma_state *mas);
+static inline void mas_store_root(struct ma_state *mas, void *entry);
+static inline int mas_root_expand(struct ma_state *mas, void *entry);
+static inline void *mas_root_locked(struct ma_state *mas);
