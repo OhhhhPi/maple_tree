@@ -108,7 +108,7 @@ retry:
 		mas->depth = 0;
 		root = mas_root(mas);
 		/* Tree with nodes */
-		if (likely(xa_is_node(root))) {
+		if (likely(is_node(root))) {
 			mas->depth = 1;
 			mas->node = mte_safe_root(root);
 			mas->offset = 0;
@@ -404,4 +404,9 @@ nomem_one:
 	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
 		mas->alloc->total = allocated;
 	mas_set_err(mas, -ENOMEM);
+}
+
+static inline bool is_node(const void *entry)
+{
+	return ((unsigned long)entry & 3) == 2 && (unsigned long)entry > 4096;
 }

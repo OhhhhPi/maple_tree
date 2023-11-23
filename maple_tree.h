@@ -310,3 +310,4 @@ static void mas_node_count(struct ma_state *mas, int count);
 static inline unsigned long mas_allocated(const struct ma_state *mas);
 static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count);
 static inline void mas_alloc_nodes(struct ma_state *mas);
+static inline bool is_node(const void *entry);
