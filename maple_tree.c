@@ -250,7 +250,12 @@ static inline void *mas_root_locked(struct ma_state *mas)
  */
 static inline void *mas_root(struct ma_state *mas)
 {
-	return rcu_dereference_check(mas->tree->ma_root, mt_locked(mas->tree));
+	if (mt_locked(mas->tree)){
+		return rcu_dereference(mas->tree->ma_root);
+	} else {
+		fprintf(stderr, "mas->tree not locked");
+	}
+	// return rcu_dereference_check(mas->tree->ma_root, mt_locked(mas->tree));
 }
 
 static inline void *mt_root_locked(struct maple_tree *mt)
@@ -258,11 +263,145 @@ static inline void *mt_root_locked(struct maple_tree *mt)
 	if (!mt_locked(mt)) {
 		fprintf(stderr, "mt_lock is not held\n");
 	}
-	return rcu_dereference(mt->ma_root, mt_locked(mt));
+	return rcu_dereference(mt->ma_root);
 }
 
 static inline bool mt_locked(const struct maple_tree *mt)
 {
-	return mt_external_lock(mt) ? mt_lock_is_held(mt) :
-		lockdep_is_held(&mt->ma_lock);
+	// TODO: how to impl lockdep_is_held()?
+	return 1;
+}
+
+/*
+ * mas_node_count() - Check if enough nodes are allocated and request more if
+ * there is not enough nodes.
+ * @mas: The maple state
+ * @count: The number of nodes needed
+ *
+ * Note: Uses GFP_NOWAIT | __GFP_NOWARN for gfp flags.
+ */
+static void mas_node_count(struct ma_state *mas, int count)
+{
+	unsigned long allocated = mas_allocated(mas);
+
+	if (allocated < count) {
+		mas_set_alloc_req(mas, count - allocated);
+		mas_alloc_nodes(mas, gfp);
+	}
+}
+
+/*
+ * mas_allocated() - Get the number of nodes allocated in a maple state.
+ * @mas: The maple state
+ *
+ * The ma_state alloc member is overloaded to hold a pointer to the first
+ * allocated node or to the number of requested nodes to allocate.  If bit 0 is
+ * set, then the alloc contains the number of requested nodes.  If there is an
+ * allocated node, then the total allocated nodes is in that node.
+ *
+ * Return: The total number of nodes allocated
+ */
+static inline unsigned long mas_allocated(const struct ma_state *mas)
+{
+	if (!mas->alloc || ((unsigned long)mas->alloc & 0x1))
+		return 0;
+
+	return mas->alloc->total;
+}
+
+/*
+ * mas_set_alloc_req() - Set the requested number of allocations.
+ * @mas: the maple state
+ * @count: the number of allocations.
+ *
+ * The requested number of allocations is either in the first allocated node,
+ * located in @mas->alloc->request_count, or directly in @mas->alloc if there is
+ * no allocated node.  Set the request either in the node or do the necessary
+ * encoding to store in @mas->alloc directly.
+ */
+static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count)
+{
+	if (!mas->alloc || ((unsigned long)mas->alloc & 0x1)) {
+		if (!count)
+			mas->alloc = NULL;
+		else
+			mas->alloc = (struct maple_alloc *)(((count) << 1U) | 1U);
+		return;
+	}
+
+	mas->alloc->request_count = count;
+}
+
+/*
+ * mas_alloc_nodes() - Allocate nodes into a maple state
+ * @mas: The maple state
+ * @gfp: The GFP Flags
+ */
+static inline void mas_alloc_nodes(struct ma_state *mas)
+{
+	struct maple_alloc *node;
+	unsigned long allocated = mas_allocated(mas);
+	unsigned int requested = mas_alloc_req(mas);
+	unsigned int count;
+	void **slots = NULL;
+	unsigned int max_req = 0;
+
+	if (!requested)
+		return;
+
+	mas_set_alloc_req(mas, 0);
+	if (mas->mas_flags & MA_STATE_PREALLOC) {
+		if (allocated)
+			return;
+		WARN_ON(!allocated);
+	}
+
+	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
+		node = (struct maple_alloc *)mt_alloc_one(gfp);
+		if (!node)
+			goto nomem_one;
+
+		if (allocated) {
+			node->slot[0] = mas->alloc;
+			node->node_count = 1;
+		} else {
+			node->node_count = 0;
+		}
+
+		mas->alloc = node;
+		node->total = ++allocated;
+		requested--;
+	}
+
+	node = mas->alloc;
+	node->request_count = 0;
+	while (requested) {
+		max_req = MAPLE_ALLOC_SLOTS - node->node_count;
+		slots = (void **)&node->slot[node->node_count];
+		max_req = min(requested, max_req);
+		count = mt_alloc_bulk(gfp, max_req, slots);
+		if (!count)
+			goto nomem_bulk;
+
+		if (node->node_count == 0) {
+			node->slot[0]->node_count = 0;
+			node->slot[0]->request_count = 0;
+		}
+
+		node->node_count += count;
+		allocated += count;
+		node = node->slot[0];
+		requested -= count;
+	}
+	mas->alloc->total = allocated;
+	return;
+
+nomem_bulk:
+	/* Clean up potential freed allocations on bulk failure */
+	memset(slots, 0, max_req * sizeof(unsigned long));
+nomem_one:
+	mas_set_alloc_req(mas, requested);
+	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
+		mas->alloc->total = allocated;
+	mas_set_err(mas, -ENOMEM);
 }

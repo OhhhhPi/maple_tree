@@ -305,3 +305,8 @@ static inline bool mas_is_ptr(const struct ma_state *mas);
 static inline void mas_store_root(struct ma_state *mas, void *entry);
 static inline int mas_root_expand(struct ma_state *mas, void *entry);
 static inline void *mas_root_locked(struct ma_state *mas);
+static inline void *mt_root_locked(struct maple_tree *mt);
+static void mas_node_count(struct ma_state *mas, int count);
+static inline unsigned long mas_allocated(const struct ma_state *mas);
+static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count);
+static inline void mas_alloc_nodes(struct ma_state *mas);
