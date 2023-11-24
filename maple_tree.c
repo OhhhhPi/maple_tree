@@ -17,6 +17,7 @@ int mtree_store(struct maple_tree *mt, unsigned long index, void *entry)
 {
 	return mtree_store_range(mt, index, index, entry);
 }
+
 int mtree_store_range(struct maple_tree *mt, unsigned long index, unsigned long last, void *entry){
 	// initialize ma_state
 	MA_STATE(mas,mt,index,last);
@@ -34,7 +35,7 @@ int mtree_store_range(struct maple_tree *mt, unsigned long index, unsigned long 
 	// mtree_lock(mt);
 retry:
 	mas_wr_store_entry(&wr_mas);
-	if (mas_nomem(&mas, gfp))
+	if (mas_nomem(&mas))
 		goto retry;
 
 	mtree_unlock(mt);
@@ -142,6 +143,112 @@ retry:
 static inline bool mas_is_start(const struct ma_state *mas)
 {
 	return mas->node == MAS_START;
+}
+
+/*
+ * mas_alloc_nodes() - Allocate nodes into a maple state
+ * @mas: The maple state
+ * @gfp: The GFP Flags
+ */
+static inline void mas_alloc_nodes(struct ma_state *mas)
+{
+	struct maple_alloc *node;
+	unsigned long allocated = mas_allocated(mas);
+	unsigned int requested = mas_alloc_req(mas);
+	unsigned int count;
+	void **slots = NULL;
+	unsigned int max_req = 0;
+
+	if (!requested)
+		return;
+
+	mas_set_alloc_req(mas, 0);
+	if (mas->mas_flags & MA_STATE_PREALLOC) {
+		if (allocated)
+			return;
+		WARN_ON(!allocated);
+	}
+
+	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
+		node = (struct maple_alloc *)mt_alloc_one(gfp);
+		if (!node)
+			goto nomem_one;
+
+		if (allocated) {
+			node->slot[0] = mas->alloc;
+			node->node_count = 1;
+		} else {
+			node->node_count = 0;
+		}
+
+		mas->alloc = node;
+		node->total = ++allocated;
+		requested--;
+	}
+
+	node = mas->alloc;
+	node->request_count = 0;
+	while (requested) {
+		max_req = MAPLE_ALLOC_SLOTS - node->node_count;
+		slots = (void **)&node->slot[node->node_count];
+		max_req = min(requested, max_req);
+		count = mt_alloc_bulk(gfp, max_req, slots);
+		if (!count)
+			goto nomem_bulk;
+
+		if (node->node_count == 0) {
+			node->slot[0]->node_count = 0;
+			node->slot[0]->request_count = 0;
+		}
+
+		node->node_count += count;
+		allocated += count;
+		node = node->slot[0];
+		requested -= count;
+	}
+	mas->alloc->total = allocated;
+	return;
+
+nomem_bulk:
+	/* Clean up potential freed allocations on bulk failure */
+	memset(slots, 0, max_req * sizeof(unsigned long));
+nomem_one:
+	mas_set_alloc_req(mas, requested);
+	if (mas->alloc && !(((unsigned long)mas->alloc & 0x1)))
+		mas->alloc->total = allocated;
+	mas_set_err(mas, -ENOMEM);
+}
+
+bool mas_is_err(struct ma_state *mas)
+{
+	// TODO: replace xrray
+	return false;
+}
+
+/**
+ * mas_nomem() - Check if there was an error allocating and do the allocation
+ * if necessary If there are allocations, then free them.
+ * @mas: The maple state
+ * @gfp: The GFP_FLAGS to use for allocations
+ * Return: true on allocation, false otherwise.
+ */
+bool mas_nomem(struct ma_state *mas)
+	__must_hold(mas->tree->ma_lock)
+{
+	if (likely(mas->node != MA_ERROR(-ENOMEM))) {
+		mas_destroy(mas);
+		return false;
+	}
+
+	mtree_unlock(mas->tree);
+	mas_alloc_nodes(mas);
+	mtree_lock(mas->tree);
+	
+	if (!mas_allocated(mas))
+		return false;
+
+	mas->node = MAS_START;
+	return true;
 }
 
 /*
@@ -409,4 +516,55 @@ nomem_one:
 static inline bool is_node(const void *entry)
 {
 	return ((unsigned long)entry & 3) == 2 && (unsigned long)entry > 4096;
+}
+
+
+
+/*
+ * mas_destroy() - destroy a maple state.
+ * @mas: The maple state
+ *
+ * Upon completion, check the left-most node and rebalance against the node to
+ * the right if necessary.  Frees any allocated nodes associated with this maple
+ * state.
+ */
+void mas_destroy(struct ma_state *mas)
+{
+	struct maple_alloc *node;
+	unsigned long total;
+
+	/*
+	 * When using mas_for_each() to insert an expected number of elements,
+	 * it is possible that the number inserted is less than the expected
+	 * number.  To fix an invalid final node, a check is performed here to
+	 * rebalance the previous node with the final node.
+	 */
+	if (mas->mas_flags & MA_STATE_REBALANCE) {
+		unsigned char end;
+
+		mas_start(mas);
+		mtree_range_walk(mas);
+		end = mas_data_end(mas) + 1;
+		if (end < mt_min_slot_count(mas->node) - 1)
+			mas_destroy_rebalance(mas, end);
+
+		mas->mas_flags &= ~MA_STATE_REBALANCE;
+	}
+	mas->mas_flags &= ~(MA_STATE_BULK|MA_STATE_PREALLOC);
+
+	total = mas_allocated(mas);
+	while (total) {
+		node = mas->alloc;
+		mas->alloc = node->slot[0];
+		if (node->node_count > 1) {
+			size_t count = node->node_count - 1;
+
+			mt_free_bulk(count, (void __rcu **)&node->slot[1]);
+			total -= count;
+		}
+		kmem_cache_free(maple_node_cache, node);
+		total--;
+	}
+
+	mas->alloc = NULL;
 }

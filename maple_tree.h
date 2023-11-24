@@ -23,6 +23,8 @@
 // After dropping the lock and attempting to resolve the error,
 // the walk would have to be restarted from the top of the tree as the tree may have been modified.
 #define MA_ERROR(err) ((struct maple_enode *)(((unsigned long)err << 2) | 2UL))
+#define mtree_lock(mt)		spin_lock((&(mt)->ma_lock))
+#define mtree_unlock(mt)	spin_unlock((&(mt)->ma_lock))
 
 #define MA_STATE(name, mt, first, end) \
 	struct ma_state name = {       \
@@ -311,3 +313,5 @@ static inline unsigned long mas_allocated(const struct ma_state *mas);
 static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count);
 static inline void mas_alloc_nodes(struct ma_state *mas);
 static inline bool is_node(const void *entry);
+bool mas_nomem(struct ma_state *mas);
+bool mas_is_err(struct ma_state *mas);
