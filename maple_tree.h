@@ -3,6 +3,7 @@
 #include <urcu.h>
 #include <limits.h>
 #include <errno.h>
+#include <string.h>
 
 // macro
 
@@ -360,5 +361,10 @@ static inline void mas_alloc_nodes(struct ma_state *mas);
 static inline bool is_node(const void *entry);
 static inline bool mte_dead_node(const struct maple_enode *enode);
 static inline struct maple_node *mte_parent(const struct maple_enode *enode);
+static inline void mas_push_node(struct ma_state *mas, struct maple_node *used);
+static inline struct maple_node *mas_pop_node(struct ma_state *mas);
+static inline unsigned int mas_alloc_req(const struct ma_state *mas);
+static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count);
+static inline struct maple_node *mt_alloc_one();
 bool mas_nomem(struct ma_state *mas);
 bool mas_is_err(struct ma_state *mas);

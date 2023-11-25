@@ -11,6 +11,22 @@
 /* Bit 2 means a NULL somewhere below */
 #define MAPLE_ENODE_NULL		0x04
 
+/*
+ * Maple state flags
+ * * MA_STATE_BULK		- Bulk insert mode
+ * * MA_STATE_REBALANCE		- Indicate a rebalance during bulk insert
+ * * MA_STATE_PREALLOC		- Preallocated nodes, WARN_ON allocation
+ */
+#define MA_STATE_BULK		1
+#define MA_STATE_REBALANCE	2
+#define MA_STATE_PREALLOC	4
+
+#define ma_parent_ptr(x) ((struct maple_pnode *)(x))
+#define ma_mnode_ptr(x) ((struct maple_node *)(x))
+#define ma_enode_ptr(x) ((struct maple_enode *)(x))
+static struct kmem_cache *maple_node_cache;
+
+
 
 static inline struct maple_node *mte_to_node(const struct maple_enode *entry)
 {
@@ -66,6 +82,11 @@ static inline bool mas_is_root_limits(const struct ma_state *mas)
 static inline bool mt_is_alloc(struct maple_tree *mt)
 {
 	return (mt->ma_flags & MT_FLAGS_ALLOC_RANGE);
+}
+
+static inline struct maple_node *mt_alloc_one()
+{
+	return (struct maple_node *)malloc(sizeof(struct maple_node));
 }
 
 static inline void mt_init(struct maple_tree *mt){
@@ -266,6 +287,163 @@ static inline void mas_store_root(struct ma_state *mas, void *entry)
 }
 
 /*
+ * mas_root_expand() - Expand a root to a node
+ * @mas: The maple state
+ * @entry: The entry to store into the tree
+ */
+static inline int mas_root_expand(struct ma_state *mas, void *entry)
+{
+	void *contents = mas_root_locked(mas);
+	enum maple_type type = maple_leaf_64;
+	struct maple_node *node;
+	void __rcu **slots;
+	unsigned long *pivots;
+	int slot = 0;
+
+	mas_node_count(mas, 1);
+	if (unlikely(mas_is_err(mas)))
+		return 0;
+
+	node = mas_pop_node(mas);
+	pivots = ma_pivots(node, type);
+	slots = ma_slots(node, type);
+	node->parent = ma_parent_ptr(
+		      ((unsigned long)mas->tree | MA_ROOT_PARENT));
+	mas->node = mt_mk_node(node, type);
+
+	if (mas->index) {
+		if (contents) {
+			rcu_assign_pointer(slots[slot], contents);
+			if (likely(mas->index > 1))
+				slot++;
+		}
+		pivots[slot++] = mas->index - 1;
+	}
+
+	rcu_assign_pointer(slots[slot], entry);
+	mas->offset = slot;
+	pivots[slot] = mas->last;
+	if (mas->last != ULONG_MAX)
+		pivots[++slot] = ULONG_MAX;
+
+	mas->depth = 1;
+	mas_set_height(mas);
+	ma_set_meta(node, maple_leaf_64, 0, slot);
+	/* swap the new root into the tree */
+	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
+	return slot;
+}
+
+/*
+ * mas_alloc_req() - get the requested number of allocations.
+ * @mas: The maple state
+ *
+ * The alloc count is either stored directly in @mas, or in
+ * @mas->alloc->request_count if there is at least one node allocated.  Decode
+ * the request count if it's stored directly in @mas->alloc.
+ *
+ * Return: The allocation request count.
+ */
+static inline unsigned int mas_alloc_req(const struct ma_state *mas)
+{
+	if ((unsigned long)mas->alloc & 0x1)
+		return (unsigned long)(mas->alloc) >> 1;
+	else if (mas->alloc)
+		return mas->alloc->request_count;
+	return 0;
+}
+
+/*
+ * mas_set_alloc_req() - Set the requested number of allocations.
+ * @mas: the maple state
+ * @count: the number of allocations.
+ *
+ * The requested number of allocations is either in the first allocated node,
+ * located in @mas->alloc->request_count, or directly in @mas->alloc if there is
+ * no allocated node.  Set the request either in the node or do the necessary
+ * encoding to store in @mas->alloc directly.
+ */
+static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count)
+{
+	if (!mas->alloc || ((unsigned long)mas->alloc & 0x1)) {
+		if (!count)
+			mas->alloc = NULL;
+		else
+			mas->alloc = (struct maple_alloc *)(((count) << 1U) | 1U);
+		return;
+	}
+
+	mas->alloc->request_count = count;
+}
+
+/*
+ * mas_pop_node() - Get a previously allocated maple node from the maple state.
+ * @mas: The maple state
+ *
+ * Return: A pointer to a maple node.
+ */
+static inline struct maple_node *mas_pop_node(struct ma_state *mas)
+{
+	struct maple_alloc *ret, *node = mas->alloc;
+	unsigned long total = mas_allocated(mas);
+	unsigned int req = mas_alloc_req(mas);
+
+	/* nothing or a request pending. */
+	if (!total){
+		fprintf(stderr, "nothing or a request pending");
+		return NULL;
+	}
+		
+
+	if (total == 1) {
+		/* single allocation in this ma_state */
+		mas->alloc = NULL;
+		ret = node;
+		goto single_node;
+	}
+
+	if (node->node_count == 1) {
+		/* Single allocation in this node. */
+		mas->alloc = node->slot[0];
+		mas->alloc->total = node->total - 1;
+		ret = node;
+		goto new_head;
+	}
+	node->total--;
+	ret = node->slot[--node->node_count];
+	node->slot[node->node_count] = NULL;
+
+single_node:
+new_head:
+	if (req) {
+		req++;
+		mas_set_alloc_req(mas, req);
+	}
+
+	memset(ret, 0, sizeof(*ret));
+	return (struct maple_node *)ret;
+}
+
+/*
+ * mas_allocated() - Get the number of nodes allocated in a maple state.
+ * @mas: The maple state
+ *
+ * The ma_state alloc member is overloaded to hold a pointer to the first
+ * allocated node or to the number of requested nodes to allocate.  If bit 0 is
+ * set, then the alloc contains the number of requested nodes.  If there is an
+ * allocated node, then the total allocated nodes is in that node.
+ *
+ * Return: The total number of nodes allocated
+ */
+static inline unsigned long mas_allocated(const struct ma_state *mas)
+{
+	if (!mas->alloc || ((unsigned long)mas->alloc & 0x1))
+		return 0;
+
+	return mas->alloc->total;
+}
+
+/*
  * mas_alloc_nodes() - Allocate nodes into a maple state
  * @mas: The maple state
  * @gfp: The GFP Flags
@@ -284,9 +462,11 @@ static inline void mas_alloc_nodes(struct ma_state *mas)
 
 	mas_set_alloc_req(mas, 0);
 	if (mas->mas_flags & MA_STATE_PREALLOC) {
-		if (allocated)
+		if (allocated){
 			return;
-		WARN_ON(!allocated);
+		} else {
+			fprintf(stderr, "mas not allocated");
+		}
 	}
 
 	if (!allocated || mas->alloc->node_count == MAPLE_ALLOC_SLOTS) {
@@ -400,53 +580,7 @@ static inline bool mas_is_ptr(const struct ma_state *mas)
 
 
 
-/*
- * mas_root_expand() - Expand a root to a node
- * @mas: The maple state
- * @entry: The entry to store into the tree
- */
-static inline int mas_root_expand(struct ma_state *mas, void *entry)
-{
-	void *contents = mas_root_locked(mas);
-	enum maple_type type = maple_leaf_64;
-	struct maple_node *node;
-	void __rcu **slots;
-	unsigned long *pivots;
-	int slot = 0;
 
-	mas_node_count(mas, 1);
-	if (unlikely(mas_is_err(mas)))
-		return 0;
-
-	node = mas_pop_node(mas);
-	pivots = ma_pivots(node, type);
-	slots = ma_slots(node, type);
-	node->parent = ma_parent_ptr(
-		      ((unsigned long)mas->tree | MA_ROOT_PARENT));
-	mas->node = mt_mk_node(node, type);
-
-	if (mas->index) {
-		if (contents) {
-			rcu_assign_pointer(slots[slot], contents);
-			if (likely(mas->index > 1))
-				slot++;
-		}
-		pivots[slot++] = mas->index - 1;
-	}
-
-	rcu_assign_pointer(slots[slot], entry);
-	mas->offset = slot;
-	pivots[slot] = mas->last;
-	if (mas->last != ULONG_MAX)
-		pivots[++slot] = ULONG_MAX;
-
-	mas->depth = 1;
-	mas_set_height(mas);
-	ma_set_meta(node, maple_leaf_64, 0, slot);
-	/* swap the new root into the tree */
-	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
-	return slot;
-}
 
 /*
  * mas_root_locked() - Get the maple tree root when holding the maple tree lock.
@@ -507,24 +641,7 @@ static void mas_node_count(struct ma_state *mas, int count)
 	}
 }
 
-/*
- * mas_allocated() - Get the number of nodes allocated in a maple state.
- * @mas: The maple state
- *
- * The ma_state alloc member is overloaded to hold a pointer to the first
- * allocated node or to the number of requested nodes to allocate.  If bit 0 is
- * set, then the alloc contains the number of requested nodes.  If there is an
- * allocated node, then the total allocated nodes is in that node.
- *
- * Return: The total number of nodes allocated
- */
-static inline unsigned long mas_allocated(const struct ma_state *mas)
-{
-	if (!mas->alloc || ((unsigned long)mas->alloc & 0x1))
-		return 0;
 
-	return mas->alloc->total;
-}
 
 /*
  * mas_set_alloc_req() - Set the requested number of allocations.
