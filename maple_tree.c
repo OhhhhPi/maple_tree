@@ -1,6 +1,73 @@
 #include "maple_tree.h"
 #include <stdio.h>
 
+#define MA_ROOT_PARENT 1
+
+
+/* Bit 1 indicates the root is a node */
+#define MAPLE_ROOT_NODE			0x02
+/* maple_type stored bit 3-6 */
+#define MAPLE_ENODE_TYPE_SHIFT		0x03
+/* Bit 2 means a NULL somewhere below */
+#define MAPLE_ENODE_NULL		0x04
+
+
+static inline struct maple_node *mte_to_node(const struct maple_enode *entry)
+{
+	return (struct maple_node *)((unsigned long)entry & ~MAPLE_NODE_MASK);
+}
+static inline struct maple_enode *mt_mk_node(const struct maple_node *node,
+					     enum maple_type type)
+{
+	return (void *)((unsigned long)node |
+			(type << MAPLE_ENODE_TYPE_SHIFT) | MAPLE_ENODE_NULL);
+}
+
+static inline void *mte_mk_root(const struct maple_enode *node)
+{
+	return (void *)((unsigned long)node | MAPLE_ROOT_NODE);
+}
+
+static inline void *mte_safe_root(const struct maple_enode *node)
+{
+	return (void *)((unsigned long)node & ~MAPLE_ROOT_NODE);
+}
+
+static inline void *mte_set_full(const struct maple_enode *node)
+{
+	return (void *)((unsigned long)node & ~MAPLE_ENODE_NULL);
+}
+
+static inline void *mte_clear_full(const struct maple_enode *node)
+{
+	return (void *)((unsigned long)node | MAPLE_ENODE_NULL);
+}
+
+static inline bool mte_has_null(const struct maple_enode *node)
+{
+	return (unsigned long)node & MAPLE_ENODE_NULL;
+}
+
+static inline bool ma_is_root(struct maple_node *node)
+{
+	return ((unsigned long)node->parent & MA_ROOT_PARENT);
+}
+
+static inline bool mte_is_root(const struct maple_enode *node)
+{
+	return ma_is_root(mte_to_node(node));
+}
+
+static inline bool mas_is_root_limits(const struct ma_state *mas)
+{
+	return !mas->min && mas->max == ULONG_MAX;
+}
+
+static inline bool mt_is_alloc(struct maple_tree *mt)
+{
+	return (mt->ma_flags & MT_FLAGS_ALLOC_RANGE);
+}
+
 static inline void mt_init(struct maple_tree *mt){
 	mt_init_flags(mt, 0);
 }
@@ -39,12 +106,22 @@ retry:
 		goto retry;
 
 	mtree_unlock(mt);
-	if (mas_is_err(&mas))
-		return xa_err(mas.node);
+	// if (mas_is_err(&mas))
+	// 	return xa_err(mas.node);
 
 	return 0;
 }
 
+/* Checks if a mas has not found anything */
+static inline bool mas_is_none(const struct ma_state *mas)
+{
+	return mas->node == MAS_NONE;
+}
+
+static inline bool mas_is_ptr(const struct ma_state *mas)
+{
+	return mas->node == MAS_ROOT;
+}
 
 /*
  * mas_wr_store_entry() - Internal call to store a value
@@ -109,7 +186,8 @@ retry:
 		mas->depth = 0;
 		root = mas_root(mas);
 		/* Tree with nodes */
-		if (likely(is_node(root))) {
+		// if (likely(is_node(root))) {
+		if (root){
 			mas->depth = 1;
 			mas->node = mte_safe_root(root);
 			mas->offset = 0;
@@ -143,6 +221,48 @@ retry:
 static inline bool mas_is_start(const struct ma_state *mas)
 {
 	return mas->node == MAS_START;
+}
+
+/*
+ * mte_dead_node() - check if the @enode is dead.
+ * @enode: The encoded maple node
+ *
+ * Return: true if dead, false otherwise.
+ */
+static inline bool mte_dead_node(const struct maple_enode *enode)
+{
+	struct maple_node *parent, *node;
+
+	node = mte_to_node(enode);
+	/* Do not reorder reads from the node prior to the parent check */
+	//smp_rmb();
+	asm volatile("mfence" ::: "memory");
+	parent = mte_parent(enode);
+	return (parent == node);
+}
+
+/*
+ * mte_parent() - Get the parent of @node.
+ * @node: The encoded maple node.
+ *
+ * Return: The parent maple node.
+ */
+static inline struct maple_node *mte_parent(const struct maple_enode *enode)
+{
+	return (void *)((unsigned long)
+			(mte_to_node(enode)->parent) & ~MAPLE_NODE_MASK);
+}
+
+static inline void mas_store_root(struct ma_state *mas, void *entry)
+{
+	if (likely((mas->last != 0) || (mas->index != 0)))
+		mas_root_expand(mas, entry);
+	else if (((unsigned long) (entry) & 3) == 2)
+		mas_root_expand(mas, entry);
+	else {
+		rcu_assign_pointer(mas->tree->ma_root, entry);
+		mas->node = MAS_START;
+	}
 }
 
 /*
@@ -278,17 +398,7 @@ static inline bool mas_is_ptr(const struct ma_state *mas)
 	return mas->node == MAS_ROOT;
 }
 
-static inline void mas_store_root(struct ma_state *mas, void *entry)
-{
-	if (likely((mas->last != 0) || (mas->index != 0)))
-		mas_root_expand(mas, entry);
-	else if (((unsigned long) (entry) & 3) == 2)
-		mas_root_expand(mas, entry);
-	else {
-		rcu_assign_pointer(mas->tree->ma_root, entry);
-		mas->node = MAS_START;
-	}
-}
+
 
 /*
  * mas_root_expand() - Expand a root to a node

@@ -6,6 +6,51 @@
 
 // macro
 
+/**
+ * DOC: Maple tree flags
+ *
+ * * MT_FLAGS_ALLOC_RANGE	- Track gaps in this tree
+ * * MT_FLAGS_USE_RCU		- Operate in RCU mode
+ * * MT_FLAGS_HEIGHT_OFFSET	- The position of the tree height in the flags
+ * * MT_FLAGS_HEIGHT_MASK	- The mask for the maple tree height value
+ * * MT_FLAGS_LOCK_MASK		- How the mt_lock is used
+ * * MT_FLAGS_LOCK_IRQ		- Acquired irq-safe
+ * * MT_FLAGS_LOCK_BH		- Acquired bh-safe
+ * * MT_FLAGS_LOCK_EXTERN	- mt_lock is not used
+ *
+ * MAPLE_HEIGHT_MAX	The largest height that can be stored
+ */
+#define MT_FLAGS_ALLOC_RANGE	0x01
+#define MT_FLAGS_USE_RCU	0x02
+#define MT_FLAGS_HEIGHT_OFFSET	0x02
+#define MT_FLAGS_HEIGHT_MASK	0x7C
+#define MT_FLAGS_LOCK_MASK	0x300
+#define MT_FLAGS_LOCK_IRQ	0x100
+#define MT_FLAGS_LOCK_BH	0x200
+#define MT_FLAGS_LOCK_EXTERN	0x300
+
+#define MAPLE_HEIGHT_MAX	31
+
+
+#define MAPLE_NODE_TYPE_MASK	0x0F
+#define MAPLE_NODE_TYPE_SHIFT	0x03
+
+#define MAPLE_RESERVED_RANGE	4096
+
+#define MAPLE_NODE_MASK		255UL
+
+
+#ifdef CONFIG_LOCKDEP
+typedef struct lockdep_map *lockdep_map_p;
+#define mt_lock_is_held(mt)	lock_is_held(mt->ma_external_lock)
+#define mt_set_external_lock(mt, lock)					\
+	(mt)->ma_external_lock = &(lock)->dep_map
+#else
+typedef struct { /* nothing */ } lockdep_map_p;
+#define mt_lock_is_held(mt)	1
+#define mt_set_external_lock(mt, lock)	do { } while (0)
+#endif
+
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
 
@@ -313,5 +358,7 @@ static inline unsigned long mas_allocated(const struct ma_state *mas);
 static inline void mas_set_alloc_req(struct ma_state *mas, unsigned long count);
 static inline void mas_alloc_nodes(struct ma_state *mas);
 static inline bool is_node(const void *entry);
+static inline bool mte_dead_node(const struct maple_enode *enode);
+static inline struct maple_node *mte_parent(const struct maple_enode *enode);
 bool mas_nomem(struct ma_state *mas);
 bool mas_is_err(struct ma_state *mas);
