@@ -334,6 +334,91 @@ static inline int mas_root_expand(struct ma_state *mas, void *entry)
 	return slot;
 }
 
+static inline struct maple_metadata *ma_meta(struct maple_node *mn,
+					     enum maple_type mt)
+{
+	switch (mt) {
+	case maple_arange_64:
+		return &mn->ma64.meta;
+	default:
+		return &mn->mr64.meta;
+	}
+}
+
+/*
+ * ma_set_meta() - Set the metadata information of a node.
+ * @mn: The maple node
+ * @mt: The maple node type
+ * @offset: The offset of the highest sub-gap in this node.
+ * @end: The end of the data in this node.
+ */
+static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
+			       unsigned char offset, unsigned char end)
+{
+	struct maple_metadata *meta = ma_meta(mn, mt);
+
+	meta->gap = offset;
+	meta->end = end;
+}
+
+static void mas_set_height(struct ma_state *mas)
+{
+	unsigned int new_flags = mas->tree->ma_flags;
+
+	new_flags &= ~MT_FLAGS_HEIGHT_MASK;
+	if(mas->depth > MAPLE_HEIGHT_MAX){
+		fprintf(stderr, "depth > MAPLE_HEIGHT_MAX");
+	}
+	new_flags |= mas->depth << MT_FLAGS_HEIGHT_OFFSET;
+	mas->tree->ma_flags = new_flags;
+}
+
+/*
+ * ma_slots() - Get a pointer to the maple node slots.
+ * @mn: The maple node
+ * @mt: The maple node type
+ *
+ * Return: A pointer to the maple node slots
+ */
+static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
+{
+	switch (mt) {
+	default:
+	case maple_arange_64:
+		return mn->ma64.slot;
+	case maple_range_64:
+	case maple_leaf_64:
+		return mn->mr64.slot;
+	case maple_dense:
+		return mn->slot;
+	}
+}
+
+/*
+ * ma_pivots() - Get a pointer to the maple node pivots.
+ * @node - the maple node
+ * @type - the node type
+ *
+ * In the event of a dead node, this array may be %NULL
+ *
+ * Return: A pointer to the maple node pivots
+ */
+static inline unsigned long *ma_pivots(struct maple_node *node,
+					   enum maple_type type)
+{
+	switch (type) {
+	case maple_arange_64:
+		return node->ma64.pivot;
+	case maple_range_64:
+	case maple_leaf_64:
+		return node->mr64.pivot;
+	case maple_dense:
+		return NULL;
+	}
+	return NULL;
+}
+
+
 /*
  * mas_alloc_req() - get the requested number of allocations.
  * @mas: The maple state
