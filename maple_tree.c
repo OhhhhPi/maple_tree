@@ -483,7 +483,6 @@ static inline void *mas_slot_locked(struct ma_state *mas, void __rcu **slots,
 	if(mt_locked(mas->tree)){
 		return rcu_dereference(slots[offset]);
 	}
-	rcu_dereference_sym(void *p);
 	// return mt_slot_locked(mas->tree, slots, offset);
 }
 
