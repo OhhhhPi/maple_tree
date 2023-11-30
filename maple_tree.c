@@ -516,6 +516,156 @@ static bool mas_wr_walk(struct ma_wr_state *wr_mas)
 
 
 /*
+ * mas_new_root() - Create a new root node that only contains the entry passed
+ * in.
+ * @mas: The maple state
+ * @entry: The entry to store.
+ *
+ * Only valid when the index == 0 and the last == ULONG_MAX
+ *
+ * Return 0 on error, 1 on success.
+ */
+static inline int mas_new_root(struct ma_state *mas, void *entry)
+{
+	struct maple_enode *root = mas_root_locked(mas);
+	enum maple_type type = maple_leaf_64;
+	struct maple_node *node;
+	void __rcu **slots;
+	unsigned long *pivots;
+
+	if (!entry && !mas->index && mas->last == ULONG_MAX) {
+		mas->depth = 0;
+		mas_set_height(mas);
+		rcu_assign_pointer(mas->tree->ma_root, entry);
+		mas->node = MAS_START;
+		goto done;
+	}
+
+	mas_node_count(mas, 1);
+	if (mas_is_err(mas))
+		return 0;
+
+	node = mas_pop_node(mas);
+	pivots = ma_pivots(node, type);
+	slots = ma_slots(node, type);
+	node->parent = ma_parent_ptr(
+		      ((unsigned long)mas->tree | MA_ROOT_PARENT));
+	mas->node = mt_mk_node(node, type);
+	rcu_assign_pointer(slots[0], entry);
+	pivots[0] = mas->last;
+	mas->depth = 1;
+	mas_set_height(mas);
+	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
+
+done:
+	if (xa_is_node(root))
+		mte_destroy_walk(root, mas->tree);
+
+	return 1;
+}
+
+/*
+ * mas_wr_spanning_store() - Create a subtree with the store operation completed
+ * and new nodes where necessary, then place the sub-tree in the actual tree.
+ * Note that mas is expected to point to the node which caused the store to
+ * span.
+ * @wr_mas: The maple write state
+ *
+ * Return: 0 on error, positive on success.
+ */
+static inline int mas_wr_spanning_store(struct ma_wr_state *wr_mas)
+{
+	struct maple_subtree_state mast;
+	struct maple_big_node b_node;
+	struct ma_state *mas;
+	unsigned char height;
+
+	/* Left and Right side of spanning store */
+	MA_STATE(l_mas, NULL, 0, 0);
+	MA_STATE(r_mas, NULL, 0, 0);
+
+	MA_WR_STATE(r_wr_mas, &r_mas, wr_mas->entry);
+	MA_WR_STATE(l_wr_mas, &l_mas, wr_mas->entry);
+
+	/*
+	 * A store operation that spans multiple nodes is called a spanning
+	 * store and is handled early in the store call stack by the function
+	 * mas_is_span_wr().  When a spanning store is identified, the maple
+	 * state is duplicated.  The first maple state walks the left tree path
+	 * to ``index``, the duplicate walks the right tree path to ``last``.
+	 * The data in the two nodes are combined into a single node, two nodes,
+	 * or possibly three nodes (see the 3-way split above).  A ``NULL``
+	 * written to the last entry of a node is considered a spanning store as
+	 * a rebalance is required for the operation to complete and an overflow
+	 * of data may happen.
+	 */
+	mas = wr_mas->mas;
+	// trace_ma_op(__func__, mas);
+
+	if (unlikely(!mas->index && mas->last == ULONG_MAX))
+		return mas_new_root(mas, wr_mas->entry);
+	/*
+	 * Node rebalancing may occur due to this store, so there may be three new
+	 * entries per level plus a new root.
+	 */
+	height = mas_mt_height(mas);
+	mas_node_count(mas, 1 + height * 3);
+	if (mas_is_err(mas))
+		return 0;
+
+	/*
+	 * Set up right side.  Need to get to the next offset after the spanning
+	 * store to ensure it's not NULL and to combine both the next node and
+	 * the node with the start together.
+	 */
+	r_mas = *mas;
+	/* Avoid overflow, walk to next slot in the tree. */
+	if (r_mas.last + 1)
+		r_mas.last++;
+
+	r_mas.index = r_mas.last;
+	mas_wr_walk_index(&r_wr_mas);
+	r_mas.last = r_mas.index = mas->last;
+
+	/* Set up left side. */
+	l_mas = *mas;
+	mas_wr_walk_index(&l_wr_mas);
+
+	if (!wr_mas->entry) {
+		mas_extend_spanning_null(&l_wr_mas, &r_wr_mas);
+		mas->offset = l_mas.offset;
+		mas->index = l_mas.index;
+		mas->last = l_mas.last = r_mas.last;
+	}
+
+	/* expanding NULLs may make this cover the entire range */
+	if (!l_mas.index && r_mas.last == ULONG_MAX) {
+		mas_set_range(mas, 0, ULONG_MAX);
+		return mas_new_root(mas, wr_mas->entry);
+	}
+
+	memset(&b_node, 0, sizeof(struct maple_big_node));
+	/* Copy l_mas and store the value in b_node. */
+	mas_store_b_node(&l_wr_mas, &b_node, l_wr_mas.node_end);
+	/* Copy r_mas into b_node. */
+	if (r_mas.offset <= r_wr_mas.node_end)
+		mas_mab_cp(&r_mas, r_mas.offset, r_wr_mas.node_end,
+			   &b_node, b_node.b_end + 1);
+	else
+		b_node.b_end++;
+
+	/* Stop spanning searches by searching for just index. */
+	l_mas.index = l_mas.last = mas->index;
+
+	mast.bn = &b_node;
+	mast.orig_l = &l_mas;
+	mast.orig_r = &r_mas;
+	/* Combine l_mas and r_mas and split them up evenly again. */
+	return mas_spanning_rebalance(mas, &mast, height + 1);
+}
+
+
+/*
  * mas_wr_store_entry() - Internal call to store a value
  * @mas: The maple state
  * @entry: The entry to store.
