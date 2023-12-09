@@ -110,6 +110,19 @@ typedef struct { /* nothing */ } lockdep_map_p;
 #define MAPLE_ARANGE64_META_MAX 15 /* Out of range for metadata */
 #define MAPLE_ALLOC_SLOTS (MAPLE_NODE_SLOTS - 1)
 
+
+/**
+ * container_of - cast a member of a structure out to the containing structure
+ * @ptr:	the pointer to the member.
+ * @type:	the type of the container struct this is embedded in.
+ * @member:	the name of the member within the struct.
+ *
+ * WARNING: any const qualifier of @ptr is lost.
+ */
+#define container_of(ptr, type, member) ({          \
+    const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+    (type *)( (char *)__mptr - offsetof(type,member) );})
+
 //data structures
 struct maple_tree {
 	union {
@@ -305,6 +318,28 @@ If the maple tree entries are pointers, free the entries first.
 	}
 static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags);
 static inline void mt_init(struct maple_tree *mt);
+
+static inline unsigned int mt_height(const struct maple_tree *mt)
+{
+	return (mt->ma_flags & MT_FLAGS_HEIGHT_MASK) >> MT_FLAGS_HEIGHT_OFFSET;
+}
+/**
+ * mas_set_range() - Set up Maple Tree operation state for a different index.
+ * @mas: Maple Tree operation state.
+ * @start: New start of range in the Maple Tree.
+ * @last: New end of range in the Maple Tree.
+ *
+ * Move the operation state to refer to a different range.  This will
+ * have the effect of starting a walk from the top; see mas_next()
+ * to move to an adjacent index.
+ */
+static inline
+void mas_set_range(struct ma_state *mas, unsigned long start, unsigned long last)
+{
+	       mas->index = start;
+	       mas->last = last;
+	       mas->node = MAS_START;
+}
 
 // Takes RCU read lock:
 //  * mtree_load()
