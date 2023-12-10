@@ -41,6 +41,40 @@
 #define MAPLE_NODE_MASK		255UL
 
 
+/*
+ * The Parent Pointer
+ * Excluding root, the parent pointer is 256B aligned like all other tree nodes.
+ * When storing a 32 or 64 bit values, the offset can fit into 5 bits.  The 16
+ * bit values need an extra bit to store the offset.  This extra bit comes from
+ * a reuse of the last bit in the node type.  This is possible by using bit 1 to
+ * indicate if bit 2 is part of the type or the slot.
+ *
+ * Note types:
+ *  0x??1 = Root
+ *  0x?00 = 16 bit nodes
+ *  0x010 = 32 bit nodes
+ *  0x110 = 64 bit nodes
+ *
+ * Slot size and alignment
+ *  0b??1 : Root
+ *  0b?00 : 16 bit values, type in 0-1, slot in 2-7
+ *  0b010 : 32 bit values, type in 0-2, slot in 3-7
+ *  0b110 : 64 bit values, type in 0-2, slot in 3-7
+ */
+
+#define MAPLE_PARENT_ROOT		0x01
+
+#define MAPLE_PARENT_SLOT_SHIFT		0x03
+#define MAPLE_PARENT_SLOT_MASK		0xF8
+
+#define MAPLE_PARENT_16B_SLOT_SHIFT	0x02
+#define MAPLE_PARENT_16B_SLOT_MASK	0xFC
+
+#define MAPLE_PARENT_RANGE64		0x06
+#define MAPLE_PARENT_RANGE32		0x04
+#define MAPLE_PARENT_NOT_RANGE16	0x02
+
+
 #ifdef CONFIG_LOCKDEP
 typedef struct lockdep_map *lockdep_map_p;
 #define mt_lock_is_held(mt)	lock_is_held(mt->ma_external_lock)
@@ -91,6 +125,12 @@ typedef struct { /* nothing */ } lockdep_map_p;
 		.entry = wr_entry,            \
 	}
 
+#define MA_TOPIARY(name, tree)						\
+	struct ma_topiary name = {					\
+		.head = NULL,						\
+		.tail = NULL,						\
+		.mtree = tree,						\
+	}
 /*
  * Allocated nodes are mutable until they have been inserted into the tree,
  * at which time they cannot change their type until they have been removed
@@ -122,6 +162,8 @@ typedef struct { /* nothing */ } lockdep_map_p;
 #define container_of(ptr, type, member) ({          \
     const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
     (type *)( (char *)__mptr - offsetof(type,member) );})
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 //data structures
 struct maple_tree {
@@ -229,12 +271,30 @@ struct maple_alloc {
  * 4. Leaf Range nodes All nodes consist of a number of node slots,
  *    pivots, and a parent pointer.
  */
+
+ /*
+ * At tree creation time, the user can specify that they're willing to trade off
+ * storing fewer entries in a tree in return for storing more information in
+ * each node.
+ *
+ * The maple tree supports recording the largest range of NULL entries available
+ * in this node, also called gaps.  This optimises the tree for allocating a
+ * range.
+ */
+
+
+struct maple_topiary {
+	struct maple_pnode *parent;
+	struct maple_enode *next; /* Overlaps the pivot */
+};
+
 enum maple_type {
 	maple_dense,
 	maple_leaf_64,
 	maple_range_64,
 	maple_arange_64,
 };
+
 struct maple_node {
 	union {
 		struct {
@@ -268,6 +328,19 @@ struct ma_wr_state {
 	void __rcu **slots; /* mas->node->slots pointer */
 	void *entry; /* The entry to write */
 	void *content; /* The existing entry that is being overwritten */
+};
+
+/*
+ * More complicated stores can cause two nodes to become one or three and
+ * potentially alter the height of the tree.  Either half of the tree may need
+ * to be rebalanced against the other.  The ma_topiary struct is used to track
+ * which nodes have been 'cut' from the tree so that the change can be done
+ * safely at a later date.  This is done to support RCU.
+ */
+struct ma_topiary {
+	struct maple_enode *head;
+	struct maple_enode *tail;
+	struct maple_tree *mtree;
 };
 
 /*
