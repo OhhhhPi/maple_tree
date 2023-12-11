@@ -2456,6 +2456,21 @@ static inline void mas_adopt_children(struct ma_state *mas,
 }
 
 /*
+ * ma_free_rcu() - Use rcu callback to free a maple node
+ * @node: The node to free
+ *
+ * The maple tree uses the parent pointer to indicate this node is no longer in
+ * use and will be freed.
+ */
+static void ma_free_rcu(struct maple_node *node)
+{
+	if(node->parent != ma_parent_ptr(node)){
+		fprintf(stdout, "node->parent != ma_parent_ptr(node)");
+	}
+	call_rcu(&node->rcu, mt_free_rcu);
+}
+
+/*
  * mas_free() - Free an encoded maple node
  * @mas: The maple state
  * @used: The encoded maple node to free.
@@ -2514,6 +2529,261 @@ static inline void mas_replace(struct ma_state *mas, bool advanced)
 		mte_set_node_dead(old_enode);
 		mas_free(mas, old_enode);
 	}
+}
+
+/*
+ * mas_new_child() - Find the new child of a node.
+ * @mas: the maple state
+ * @child: the maple state to store the child.
+ */
+static inline bool mas_new_child(struct ma_state *mas, struct ma_state *child)
+	// __must_hold(mas->tree->ma_lock)
+{
+	enum maple_type mt;
+	unsigned char offset;
+	unsigned char end;
+	unsigned long *pivots;
+	struct maple_enode *entry;
+	struct maple_node *node;
+	void __rcu **slots;
+
+	mt = mte_node_type(mas->node);
+	node = mas_mn(mas);
+	slots = ma_slots(node, mt);
+	pivots = ma_pivots(node, mt);
+	end = ma_data_end(node, mt, pivots, mas->max);
+	for (offset = mas->offset; offset <= end; offset++) {
+		entry = mas_slot_locked(mas, slots, offset);
+		if (mte_parent(entry) == node) {
+			*child = *mas;
+			mas->offset = offset + 1;
+			child->offset = offset;
+			mas_descend(child);
+			child->offset = 0;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * mas_descend_adopt() - Descend through a sub-tree and adopt children.
+ * @mas: the maple state with the maple encoded node of the sub-tree.
+ *
+ * Descend through a sub-tree and adopt children who do not have the correct
+ * parents set.  Follow the parents which have the correct parents as they are
+ * the new entries which need to be followed to find other incorrectly set
+ * parents.
+ */
+static inline void mas_descend_adopt(struct ma_state *mas)
+{
+	struct ma_state list[3], next[3];
+	int i, n;
+
+	/*
+	 * At each level there may be up to 3 correct parent pointers which indicates
+	 * the new nodes which need to be walked to find any new nodes at a lower level.
+	 */
+
+	for (i = 0; i < 3; i++) {
+		list[i] = *mas;
+		list[i].offset = 0;
+		next[i].offset = 0;
+	}
+	next[0] = *mas;
+
+	while (!mte_is_leaf(list[0].node)) {
+		n = 0;
+		for (i = 0; i < 3; i++) {
+			if (mas_is_none(&list[i]))
+				continue;
+
+			if (i && list[i-1].node == list[i].node)
+				continue;
+
+			while ((n < 3) && (mas_new_child(&list[i], &next[n])))
+				n++;
+
+			mas_adopt_children(&list[i], list[i].node);
+		}
+
+		while (n < 3)
+			next[n++].node = MAS_NONE;
+
+		/* descend by setting the list to the children */
+		for (i = 0; i < 3; i++)
+			list[i] = next[i];
+	}
+}
+
+/*
+ * mas_mat_free() - Free all nodes in a dead list.
+ * @mas - the maple state
+ * @mat - the ma_topiary linked list of dead nodes to free.
+ *
+ * Free walk a dead list.
+ */
+static void mas_mat_free(struct ma_state *mas, struct ma_topiary *mat)
+{
+	struct maple_enode *next;
+
+	while (mat->head) {
+		next = mte_to_mat(mat->head)->next;
+		mas_free(mas, mat->head);
+		mat->head = next;
+	}
+}
+
+/*
+ * mas_mat_destroy() - Free all nodes and subtrees in a dead list.
+ * @mas - the maple state
+ * @mat - the ma_topiary linked list of dead nodes to free.
+ *
+ * Destroy walk a dead list.
+ */
+static void mas_mat_destroy(struct ma_state *mas, struct ma_topiary *mat)
+{
+	struct maple_enode *next;
+
+	while (mat->head) {
+		next = mte_to_mat(mat->head)->next;
+		mte_destroy_walk(mat->head, mat->mtree);
+		mat->head = next;
+	}
+}
+
+/*
+ * ma_set_meta_gap() - Set the largest gap location in a nodes metadata
+ * @mn: The maple node
+ * @mn: The maple node type
+ * @offset: The location of the largest gap.
+ */
+static inline void ma_set_meta_gap(struct maple_node *mn, enum maple_type mt,
+				   unsigned char offset)
+{
+
+	struct maple_metadata *meta = ma_meta(mn, mt);
+
+	meta->gap = offset;
+}
+
+/*
+ * ma_max_gap() - Get the maximum gap in a maple node (non-leaf)
+ * @node: The maple node
+ * @gaps: The pointer to the gaps
+ * @mt: The maple node type
+ * @*off: Pointer to store the offset location of the gap.
+ *
+ * Uses the metadata data end to scan backwards across set gaps.
+ *
+ * Return: The maximum gap value
+ */
+static inline unsigned long
+ma_max_gap(struct maple_node *node, unsigned long *gaps, enum maple_type mt,
+	    unsigned char *off)
+{
+	unsigned char offset, i;
+	unsigned long max_gap = 0;
+
+	i = offset = ma_meta_end(node, mt);
+	do {
+		if (gaps[i] > max_gap) {
+			max_gap = gaps[i];
+			offset = i;
+		}
+	} while (i--);
+
+	*off = offset;
+	return max_gap;
+}
+
+/*
+ * mas_parent_gap() - Set the parent gap and any gaps above, as needed
+ * @mas: The maple state
+ * @offset: The gap offset in the parent to set
+ * @new: The new gap value.
+ *
+ * Set the parent gap then continue to set the gap upwards, using the metadata
+ * of the parent to see if it is necessary to check the node above.
+ */
+static inline void mas_parent_gap(struct ma_state *mas, unsigned char offset,
+		unsigned long new)
+{
+	unsigned long meta_gap = 0;
+	struct maple_node *pnode;
+	struct maple_enode *penode;
+	unsigned long *pgaps;
+	unsigned char meta_offset;
+	enum maple_type pmt;
+
+	pnode = mte_parent(mas->node);
+	pmt = mas_parent_type(mas, mas->node);
+	penode = mt_mk_node(pnode, pmt);
+	pgaps = ma_gaps(pnode, pmt);
+
+ascend:
+	// MAS_BUG_ON(mas, pmt != maple_arange_64);
+	if(pmt != maple_arange_64){
+		fprintf(stderr, "pmt != maple_arange_64");
+	}
+	meta_offset = ma_meta_gap(pnode, pmt);
+	if (meta_offset == MAPLE_ARANGE64_META_MAX)
+		meta_gap = 0;
+	else
+		meta_gap = pgaps[meta_offset];
+
+	pgaps[offset] = new;
+
+	if (meta_gap == new)
+		return;
+
+	if (offset != meta_offset) {
+		if (meta_gap > new)
+			return;
+
+		ma_set_meta_gap(pnode, pmt, offset);
+	} else if (new < meta_gap) {
+		meta_offset = 15;
+		new = ma_max_gap(pnode, pgaps, pmt, &meta_offset);
+		ma_set_meta_gap(pnode, pmt, meta_offset);
+	}
+
+	if (ma_is_root(pnode))
+		return;
+
+	/* Go to the parent node. */
+	pnode = mte_parent(penode);
+	pmt = mas_parent_type(mas, penode);
+	pgaps = ma_gaps(pnode, pmt);
+	offset = mte_parent_slot(penode);
+	penode = mt_mk_node(pnode, pmt);
+	goto ascend;
+}
+
+/*
+ * mas_update_gap() - Update a nodes gaps and propagate up if necessary.
+ * @mas - the maple state.
+ */
+static inline void mas_update_gap(struct ma_state *mas)
+{
+	unsigned char pslot;
+	unsigned long p_gap;
+	unsigned long max_gap;
+
+	if (!mt_is_alloc(mas->tree))
+		return;
+
+	if (mte_is_root(mas->node))
+		return;
+
+	max_gap = mas_max_gap(mas);
+
+	pslot = mte_parent_slot(mas->node);
+	p_gap = ma_gaps(mte_parent(mas->node),
+			mas_parent_type(mas, mas->node))[pslot];
+
+	if (p_gap != max_gap)
+		mas_parent_gap(mas, pslot, max_gap);
 }
 
 /*
