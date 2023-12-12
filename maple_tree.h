@@ -164,6 +164,7 @@ typedef struct { /* nothing */ } lockdep_map_p;
     (type *)( (char *)__mptr - offsetof(type,member) );})
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 //data structures
 struct maple_tree {
@@ -395,6 +396,33 @@ static inline void mt_init(struct maple_tree *mt);
 static inline unsigned int mt_height(const struct maple_tree *mt)
 {
 	return (mt->ma_flags & MT_FLAGS_HEIGHT_MASK) >> MT_FLAGS_HEIGHT_OFFSET;
+}
+
+/* Checks if a mas has not found anything */
+static inline bool mas_is_none(const struct ma_state *mas)
+{
+	return mas->node == MAS_NONE;
+}
+static inline bool mt_in_rcu(struct maple_tree *mt)
+{
+#ifdef CONFIG_MAPLE_RCU_DISABLED
+	return false;
+#endif
+	return mt->ma_flags & MT_FLAGS_USE_RCU;
+}
+/**
+ * mas_reset() - Reset a Maple Tree operation state.
+ * @mas: Maple Tree operation state.
+ *
+ * Resets the error or walk state of the @mas so future walks of the
+ * array will start from the root.  Use this if you have dropped the
+ * lock and want to reuse the ma_state.
+ *
+ * Context: Any context.
+ */
+static inline void mas_reset(struct ma_state *mas)
+{
+	mas->node = MAS_START;
 }
 /**
  * mas_set_range() - Set up Maple Tree operation state for a different index.
