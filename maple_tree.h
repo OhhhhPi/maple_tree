@@ -5,41 +5,6 @@
 #include <errno.h>
 #include <string.h>
 
-// macro
-
-/**
- * DOC: Maple tree flags
- *
- * * MT_FLAGS_ALLOC_RANGE	- Track gaps in this tree
- * * MT_FLAGS_USE_RCU		- Operate in RCU mode
- * * MT_FLAGS_HEIGHT_OFFSET	- The position of the tree height in the flags
- * * MT_FLAGS_HEIGHT_MASK	- The mask for the maple tree height value
- * * MT_FLAGS_LOCK_MASK		- How the mt_lock is used
- * * MT_FLAGS_LOCK_IRQ		- Acquired irq-safe
- * * MT_FLAGS_LOCK_BH		- Acquired bh-safe
- * * MT_FLAGS_LOCK_EXTERN	- mt_lock is not used
- *
- * MAPLE_HEIGHT_MAX	The largest height that can be stored
- */
-#define MT_FLAGS_ALLOC_RANGE	0x01
-#define MT_FLAGS_USE_RCU	0x02
-#define MT_FLAGS_HEIGHT_OFFSET	0x02
-#define MT_FLAGS_HEIGHT_MASK	0x7C
-#define MT_FLAGS_LOCK_MASK	0x300
-#define MT_FLAGS_LOCK_IRQ	0x100
-#define MT_FLAGS_LOCK_BH	0x200
-#define MT_FLAGS_LOCK_EXTERN	0x300
-
-#define MAPLE_HEIGHT_MAX	31
-
-
-#define MAPLE_NODE_TYPE_MASK	0x0F
-#define MAPLE_NODE_TYPE_SHIFT	0x03
-
-#define MAPLE_RESERVED_RANGE	4096
-
-#define MAPLE_NODE_MASK		255UL
-
 
 /*
  * The Parent Pointer
@@ -75,19 +40,8 @@
 #define MAPLE_PARENT_NOT_RANGE16	0x02
 
 
-#ifdef CONFIG_LOCKDEP
-typedef struct lockdep_map *lockdep_map_p;
-#define mt_lock_is_held(mt)	lock_is_held(mt->ma_external_lock)
-#define mt_set_external_lock(mt, lock)					\
-	(mt)->ma_external_lock = &(lock)->dep_map
-#else
-typedef struct { /* nothing */ } lockdep_map_p;
-#define mt_lock_is_held(mt)	1
-#define mt_set_external_lock(mt, lock)	do { } while (0)
-#endif
-
-#define likely(x)       __builtin_expect((x),1)
-#define unlikely(x)     __builtin_expect((x),0)
+#define likely(x)       __builtin_expect(!!(x),1)
+#define unlikely(x)     __builtin_expect(!!(x),0)
 
 #define MAS_START ((struct maple_enode *)1UL) // we have not searched the tree
 #define MAS_ROOT             \
@@ -164,17 +118,11 @@ typedef struct { /* nothing */ } lockdep_map_p;
     (type *)( (char *)__mptr - offsetof(type,member) );})
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-//data structures
-struct maple_tree {
-	union {
-		// locks
-		spinlock ma_lock;
-	};
-	void *ma_root;
-	unsigned int ma_flags;
-};
+
+
 
 struct ma_state {
 	struct maple_tree *tree; /* The tree we're operating in */
@@ -257,6 +205,63 @@ struct maple_alloc {
 	struct maple_alloc *slot[MAPLE_ALLOC_SLOTS];
 };
 
+struct maple_topiary {
+	struct maple_pnode *parent;
+	struct maple_enode *next; /* Overlaps the pivot */
+};
+
+enum maple_type {
+	maple_dense,
+	maple_leaf_64,
+	maple_range_64,
+	maple_arange_64,
+};
+
+/**
+ * DOC: Maple tree flags
+ *
+ * * MT_FLAGS_ALLOC_RANGE	- Track gaps in this tree
+ * * MT_FLAGS_USE_RCU		- Operate in RCU mode
+ * * MT_FLAGS_HEIGHT_OFFSET	- The position of the tree height in the flags
+ * * MT_FLAGS_HEIGHT_MASK	- The mask for the maple tree height value
+ * * MT_FLAGS_LOCK_MASK		- How the mt_lock is used
+ * * MT_FLAGS_LOCK_IRQ		- Acquired irq-safe
+ * * MT_FLAGS_LOCK_BH		- Acquired bh-safe
+ * * MT_FLAGS_LOCK_EXTERN	- mt_lock is not used
+ *
+ * MAPLE_HEIGHT_MAX	The largest height that can be stored
+ */
+#define MT_FLAGS_ALLOC_RANGE	0x01
+#define MT_FLAGS_USE_RCU	0x02
+#define MT_FLAGS_HEIGHT_OFFSET	0x02
+#define MT_FLAGS_HEIGHT_MASK	0x7C
+#define MT_FLAGS_LOCK_MASK	0x300
+#define MT_FLAGS_LOCK_IRQ	0x100
+#define MT_FLAGS_LOCK_BH	0x200
+#define MT_FLAGS_LOCK_EXTERN	0x300
+
+#define MAPLE_HEIGHT_MAX	31
+
+
+#define MAPLE_NODE_TYPE_MASK	0x0F
+#define MAPLE_NODE_TYPE_SHIFT	0x03
+
+#define MAPLE_RESERVED_RANGE	4096
+
+#define MAPLE_NODE_MASK		255UL
+
+#ifdef CONFIG_LOCKDEP
+typedef struct lockdep_map *lockdep_map_p;
+#define mt_lock_is_held(mt)	lock_is_held(mt->ma_external_lock)
+#define mt_set_external_lock(mt, lock)					\
+	(mt)->ma_external_lock = &(lock)->dep_map
+#else
+typedef struct { /* nothing */ } lockdep_map_p;
+#define mt_lock_is_held(mt)	1
+#define mt_set_external_lock(mt, lock)	do { } while (0)
+#endif
+
+
 /*
  * The Maple Tree squeezes various bits in at various points which aren't
  * necessarily obvious.  Usually, this is done by observing that pointers are
@@ -283,18 +288,15 @@ struct maple_alloc {
  * range.
  */
 
-
-struct maple_topiary {
-	struct maple_pnode *parent;
-	struct maple_enode *next; /* Overlaps the pivot */
+struct maple_tree {
+	union {
+		// locks
+		spinlock ma_lock;
+	};
+	void *ma_root;
+	unsigned int ma_flags;
 };
 
-enum maple_type {
-	maple_dense,
-	maple_leaf_64,
-	maple_range_64,
-	maple_arange_64,
-};
 
 struct maple_node {
 	union {
@@ -382,12 +384,12 @@ mtree_destroy() remove all entries from a maple tree by calling
 If the maple tree entries are pointers, free the entries first.
 */
 
-// Normal API
 #define DEFINE_MTREE(name) struct maple_tree name = MTREE_INIT(name, 0)
 
 #define MTREE_INIT(name, __flags)                                     \
 	{                                                             \
-		.ma_lock = SPINLOCK_INITIALIZER, .ma_flags = __flags, \
+		.ma_lock = SPINLOCK_INITIALIZER, 								\
+		.ma_flags = __flags,						 			\
 		.ma_root = NULL,                                      \
 	}
 static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags);
@@ -403,6 +405,20 @@ static inline bool mas_is_none(const struct ma_state *mas)
 {
 	return mas->node == MAS_NONE;
 }
+/* Checks if a mas has been paused */
+static inline bool mas_is_paused(const struct ma_state *mas)
+{
+	return mas->node == MAS_PAUSE;
+}
+
+/* Check if the mas is pointing to a node or not */
+static inline bool mas_is_active(struct ma_state *mas)
+{
+	if ((unsigned long)mas->node >= MAPLE_RESERVED_RANGE)
+		return true;
+
+	return false;
+}
 static inline bool mt_in_rcu(struct maple_tree *mt)
 {
 #ifdef CONFIG_MAPLE_RCU_DISABLED
@@ -410,20 +426,7 @@ static inline bool mt_in_rcu(struct maple_tree *mt)
 #endif
 	return mt->ma_flags & MT_FLAGS_USE_RCU;
 }
-/**
- * mas_reset() - Reset a Maple Tree operation state.
- * @mas: Maple Tree operation state.
- *
- * Resets the error or walk state of the @mas so future walks of the
- * array will start from the root.  Use this if you have dropped the
- * lock and want to reuse the ma_state.
- *
- * Context: Any context.
- */
-static inline void mas_reset(struct ma_state *mas)
-{
-	mas->node = MAS_START;
-}
+
 /**
  * mas_set_range() - Set up Maple Tree operation state for a different index.
  * @mas: Maple Tree operation state.
@@ -441,6 +444,35 @@ void mas_set_range(struct ma_state *mas, unsigned long start, unsigned long last
 	       mas->last = last;
 	       mas->node = MAS_START;
 }
+/**
+ * mas_set() - Set up Maple Tree operation state for a different index.
+ * @mas: Maple Tree operation state.
+ * @index: New index into the Maple Tree.
+ *
+ * Move the operation state to refer to a different index.  This will
+ * have the effect of starting a walk from the top; see mas_next()
+ * to move to an adjacent index.
+ */
+static inline void mas_set(struct ma_state *mas, unsigned long index)
+{
+
+	mas_set_range(mas, index, index);
+}
+/**
+ * mas_reset() - Reset a Maple Tree operation state.
+ * @mas: Maple Tree operation state.
+ *
+ * Resets the error or walk state of the @mas so future walks of the
+ * array will start from the root.  Use this if you have dropped the
+ * lock and want to reuse the ma_state.
+ *
+ * Context: Any context.
+ */
+static inline void mas_reset(struct ma_state *mas)
+{
+	mas->node = MAS_START;
+}
+
 
 // Takes RCU read lock:
 //  * mtree_load()
