@@ -2,9 +2,8 @@
 #include "spinlock.h"
 #include <urcu.h>
 #include <limits.h>
-#include <errno.h>
 #include <string.h>
-
+#include <stdio.h>
 
 /*
  * The Parent Pointer
@@ -120,24 +119,9 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 
 
-
-
-struct ma_state {
-	struct maple_tree *tree; /* The tree we're operating in */
-	unsigned long index; /* The index we're operating on - range start */
-	unsigned long last; /* The last index we're operating on - range end */
-	struct maple_enode *node; /* The node containing this entry */
-	unsigned long
-		min; /* The minimum index of this node - implied pivot min */
-	unsigned long
-		max; /* The maximum index of this node - implied pivot max */
-	struct maple_alloc *alloc; /* Allocated nodes for this operation */
-	unsigned char depth; /* depth of tree descent during write */
-	unsigned char offset;
-	unsigned char mas_flags;
-};
 
 /*
  * This metadata is used to optimize the gap updating code and in reverse
@@ -205,10 +189,7 @@ struct maple_alloc {
 	struct maple_alloc *slot[MAPLE_ALLOC_SLOTS];
 };
 
-struct maple_topiary {
-	struct maple_pnode *parent;
-	struct maple_enode *next; /* Overlaps the pivot */
-};
+
 
 enum maple_type {
 	maple_dense,
@@ -216,6 +197,14 @@ enum maple_type {
 	maple_range_64,
 	maple_arange_64,
 };
+
+
+
+
+
+
+
+
 
 /**
  * DOC: Maple tree flags
@@ -318,19 +307,10 @@ struct maple_node {
 		struct maple_alloc alloc;
 	};
 };
-struct ma_wr_state {
-	struct ma_state *mas;
-	struct maple_node *node; /* Decoded mas->node */
-	unsigned long r_min; /* range min */
-	unsigned long r_max; /* range max */
-	enum maple_type type; /* mas->node type */
-	unsigned char offset_end; /* The offset where the write ends */
-	unsigned char node_end; /* mas->node end */
-	unsigned long *pivots; /* mas->node->pivots pointer */
-	unsigned long end_piv; /* The pivot at the offset end */
-	void __rcu **slots; /* mas->node->slots pointer */
-	void *entry; /* The entry to write */
-	void *content; /* The existing entry that is being overwritten */
+
+struct maple_topiary {
+	struct maple_pnode *parent;
+	struct maple_enode *next; /* Overlaps the pivot */
 };
 
 /*
@@ -346,58 +326,110 @@ struct ma_topiary {
 	struct maple_tree *mtree;
 };
 
-/*
-Start by initialising a maple tree
-DEFINE_MTREE() for statically allocated maple trees 
-mt_init() for dynamically allocated ones. 
-A freshly-initialised maple tree contains a ``NULL`` pointer for the range ``0`` - ``ULONG_MAX``.  
+void *mtree_load(struct maple_tree *mt, unsigned long index);
 
-two types of maple trees supported: the allocation tree and the regular tree.
-The regular tree has a higher branching factor for internal nodes.  
-The allocation tree has a lower branching factor 
-but allows the user to search for a gap of a given size or larger from either ``0`` upwards or ``ULONG_MAX`` down.
-An allocation tree can be used by passing in the ``MT_FLAGS_ALLOC_RANGE`` flag when initialising the tree.
+int mtree_insert(struct maple_tree *mt, unsigned long index,
+		void *entry);
+int mtree_insert_range(struct maple_tree *mt, unsigned long first,
+		unsigned long last, void *entry);
+int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
+		void *entry, unsigned long size, unsigned long min,
+		unsigned long max);
+int mtree_alloc_rrange(struct maple_tree *mt, unsigned long *startp,
+		void *entry, unsigned long size, unsigned long min,
+		unsigned long max);
 
-mtree_store() 
-mtree_store_range() set entries
-mtree_store() will overwrite any entry with the new entry and return 0 on success or an error code otherwise.  
-mtree_store_range() works in the same way but takes a range.  
-mtree_load() is used to retrieve the entry stored at a given index. 
-mtree_erase() erase an entire range by only knowing one value within that range
-mtree_store() call with an entry of NULL may be used to partially erase a range or many ranges at once.
+int mtree_store_range(struct maple_tree *mt, unsigned long first,
+		      unsigned long last, void *entry);
+int mtree_store(struct maple_tree *mt, unsigned long index,
+		void *entry);
+void *mtree_erase(struct maple_tree *mt, unsigned long index);
 
-mtree_insert_range() store a new entry to a range (or index) if that range is currently ``NULL``
-mtree_insert() return -EEXIST if the range is not empty.
+void mtree_destroy(struct maple_tree *mt);
+void __mt_destroy(struct maple_tree *mt);
 
-mt_find() search for an entry from an index upwards
-
-mt_for_each() walk each entry within a range  
-You must provide a temporary variable to store a cursor.  
-If you want to walk each element of the tree then ``0`` and ``ULONG_MAX`` may be used as the range.  
-If the caller is going to hold the lock for the duration of the walk 
-then it is worth looking at the mas_for_each() API in the :ref:`maple-tree-advanced-api` section.
-
-Sometimes it is necessary to ensure the next call to store to a maple tree does
-not allocate memory, please see :ref:`maple-tree-advanced-api` for this use case.
-
-mtree_destroy() remove all entries from a maple tree by calling
-If the maple tree entries are pointers, free the entries first.
-*/
-
-#define DEFINE_MTREE(name) struct maple_tree name = MTREE_INIT(name, 0)
-
-#define MTREE_INIT(name, __flags)                                     \
-	{                                                             \
-		.ma_lock = SPINLOCK_INITIALIZER, 								\
-		.ma_flags = __flags,						 			\
-		.ma_root = NULL,                                      \
-	}
-static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags);
-static inline void mt_init(struct maple_tree *mt);
-
-static inline unsigned int mt_height(const struct maple_tree *mt)
+/**
+ * mtree_empty() - Determine if a tree has any present entries.
+ * @mt: Maple Tree.
+ *
+ * Context: Any context.
+ * Return: %true if the tree contains only NULL pointers.
+ */
+static inline bool mtree_empty(const struct maple_tree *mt)
 {
-	return (mt->ma_flags & MT_FLAGS_HEIGHT_MASK) >> MT_FLAGS_HEIGHT_OFFSET;
+	return mt->ma_root == NULL;
+}
+
+struct ma_state {
+	struct maple_tree *tree; /* The tree we're operating in */
+	unsigned long index; /* The index we're operating on - range start */
+	unsigned long last; /* The last index we're operating on - range end */
+	struct maple_enode *node; /* The node containing this entry */
+	unsigned long
+		min; /* The minimum index of this node - implied pivot min */
+	unsigned long
+		max; /* The maximum index of this node - implied pivot max */
+	struct maple_alloc *alloc; /* Allocated nodes for this operation */
+	unsigned char depth; /* depth of tree descent during write */
+	unsigned char offset;
+	unsigned char mas_flags;
+};
+
+struct ma_wr_state {
+	struct ma_state *mas;
+	struct maple_node *node; /* Decoded mas->node */
+	unsigned long r_min; /* range min */
+	unsigned long r_max; /* range max */
+	enum maple_type type; /* mas->node type */
+	unsigned char offset_end; /* The offset where the write ends */
+	unsigned char node_end; /* mas->node end */
+	unsigned long *pivots; /* mas->node->pivots pointer */
+	unsigned long end_piv; /* The pivot at the offset end */
+	void __rcu **slots; /* mas->node->slots pointer */
+	void *entry; /* The entry to write */
+	void *content; /* The existing entry that is being overwritten */
+};
+
+void *mas_walk(struct ma_state *mas);
+void *mas_store(struct ma_state *mas, void *entry);
+void *mas_erase(struct ma_state *mas);
+int mas_store_gfp(struct ma_state *mas, void *entry);
+void mas_store_prealloc(struct ma_state *mas, void *entry);
+void *mas_find(struct ma_state *mas, unsigned long max);
+void *mas_find_range(struct ma_state *mas, unsigned long max);
+void *mas_find_rev(struct ma_state *mas, unsigned long min);
+void *mas_find_range_rev(struct ma_state *mas, unsigned long max);
+int mas_preallocate(struct ma_state *mas);
+bool mas_is_err(struct ma_state *mas);
+
+bool mas_nomem(struct ma_state *mas);
+void mas_pause(struct ma_state *mas);
+void maple_tree_init(void);
+void mas_destroy(struct ma_state *mas);
+int mas_expected_entries(struct ma_state *mas, unsigned long nr_entries);
+
+void *mas_prev(struct ma_state *mas, unsigned long min);
+void *mas_prev_range(struct ma_state *mas, unsigned long max);
+void *mas_next(struct ma_state *mas, unsigned long max);
+void *mas_next_range(struct ma_state *mas, unsigned long max);
+
+int mas_empty_area(struct ma_state *mas, unsigned long min, unsigned long max,
+		   unsigned long size);
+/*
+ * This finds an empty area from the highest address to the lowest.
+ * AKA "Topdown" version,
+ */
+int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
+		       unsigned long max, unsigned long size);
+
+static inline void mas_init(struct ma_state *mas, struct maple_tree *tree,
+			    unsigned long addr)
+{
+	memset(mas, 0, sizeof(struct ma_state));
+	mas->tree = tree;
+	mas->index = mas->last = addr;
+	mas->max = ULONG_MAX;
+	mas->node = MAS_START;
 }
 
 /* Checks if a mas has not found anything */
@@ -405,6 +437,7 @@ static inline bool mas_is_none(const struct ma_state *mas)
 {
 	return mas->node == MAS_NONE;
 }
+
 /* Checks if a mas has been paused */
 static inline bool mas_is_paused(const struct ma_state *mas)
 {
@@ -419,13 +452,35 @@ static inline bool mas_is_active(struct ma_state *mas)
 
 	return false;
 }
-static inline bool mt_in_rcu(struct maple_tree *mt)
+
+/**
+ * mas_reset() - Reset a Maple Tree operation state.
+ * @mas: Maple Tree operation state.
+ *
+ * Resets the error or walk state of the @mas so future walks of the
+ * array will start from the root.  Use this if you have dropped the
+ * lock and want to reuse the ma_state.
+ *
+ * Context: Any context.
+ */
+static inline void mas_reset(struct ma_state *mas)
 {
-#ifdef CONFIG_MAPLE_RCU_DISABLED
-	return false;
-#endif
-	return mt->ma_flags & MT_FLAGS_USE_RCU;
+	mas->node = MAS_START;
 }
+
+/**
+ * mas_for_each() - Iterate over a range of the maple tree.
+ * @__mas: Maple Tree operation state (maple_state)
+ * @__entry: Entry retrieved from the tree
+ * @__max: maximum index to retrieve from the tree
+ *
+ * When returned, mas->index and mas->last will hold the entire range for the
+ * entry.
+ *
+ * Note: may return the zero entry.
+ */
+#define mas_for_each(__mas, __entry, __max) \
+	while (((__entry) = mas_find((__mas), (__max))) != NULL)
 
 /**
  * mas_set_range() - Set up Maple Tree operation state for a different index.
@@ -444,6 +499,7 @@ void mas_set_range(struct ma_state *mas, unsigned long start, unsigned long last
 	       mas->last = last;
 	       mas->node = MAS_START;
 }
+
 /**
  * mas_set() - Set up Maple Tree operation state for a different index.
  * @mas: Maple Tree operation state.
@@ -458,56 +514,117 @@ static inline void mas_set(struct ma_state *mas, unsigned long index)
 
 	mas_set_range(mas, index, index);
 }
+
+static inline bool mt_external_lock(const struct maple_tree *mt)
+{
+	return (mt->ma_flags & MT_FLAGS_LOCK_MASK) == MT_FLAGS_LOCK_EXTERN;
+}
+
 /**
- * mas_reset() - Reset a Maple Tree operation state.
- * @mas: Maple Tree operation state.
+ * mt_init_flags() - Initialise an empty maple tree with flags.
+ * @mt: Maple Tree
+ * @flags: maple tree flags.
  *
- * Resets the error or walk state of the @mas so future walks of the
- * array will start from the root.  Use this if you have dropped the
- * lock and want to reuse the ma_state.
+ * If you need to initialise a Maple Tree with special flags (eg, an
+ * allocation tree), use this function.
  *
  * Context: Any context.
  */
-static inline void mas_reset(struct ma_state *mas)
+static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags)
 {
-	mas->node = MAS_START;
+	mt->ma_flags = flags;
+	if (!mt_external_lock(mt))
+		mt->ma_lock = (spinlock)SPINLOCK_INITIALIZER;
+	rcu_assign_pointer(mt->ma_root, NULL);
 }
 
+/**
+ * mt_init() - Initialise an empty maple tree.
+ * @mt: Maple Tree
+ *
+ * An empty Maple Tree.
+ *
+ * Context: Any context.
+ */
+static inline void mt_init(struct maple_tree *mt)
+{
+	mt_init_flags(mt, 0);
+}
 
-// Takes RCU read lock:
-//  * mtree_load()
-//  * mt_find()
-//  * mt_for_each()
-//  * mt_next()
-//  * mt_prev()
+static inline bool mt_in_rcu(struct maple_tree *mt)
+{
+#ifdef CONFIG_MAPLE_RCU_DISABLED
+	return false;
+#endif
+	return mt->ma_flags & MT_FLAGS_USE_RCU;
+}
 
-void *mtree_load(struct maple_tree *mt, unsigned long index);
+/**
+ * mt_clear_in_rcu() - Switch the tree to non-RCU mode.
+ * @mt: The Maple Tree
+ */
+static inline void mt_clear_in_rcu(struct maple_tree *mt)
+{
+	if (!mt_in_rcu(mt))
+		return;
+
+	if (mt_external_lock(mt)) {
+		// WARN_ON(!mt_lock_is_held(mt));
+		if (!mt_lock_is_held(mt)) {
+			fprintf(stdout, "!mt_lock_is_held(mt)");
+		}
+		mt->ma_flags &= ~MT_FLAGS_USE_RCU;
+	} else {
+		mtree_lock(mt);
+		mt->ma_flags &= ~MT_FLAGS_USE_RCU;
+		mtree_unlock(mt);
+	}
+}
+
+/**
+ * mt_set_in_rcu() - Switch the tree to RCU safe mode.
+ * @mt: The Maple Tree
+ */
+static inline void mt_set_in_rcu(struct maple_tree *mt)
+{
+	if (mt_in_rcu(mt))
+		return;
+
+	if (mt_external_lock(mt)) {
+		// WARN_ON(!mt_lock_is_held(mt));
+		if (!mt_lock_is_held(mt)) {
+			fprintf(stdout, "!mt_lock_is_held(mt)");
+		}
+		mt->ma_flags |= MT_FLAGS_USE_RCU;
+	} else {
+		mtree_lock(mt);
+		mt->ma_flags |= MT_FLAGS_USE_RCU;
+		mtree_unlock(mt);
+	}
+}
+
+static inline unsigned int mt_height(const struct maple_tree *mt)
+{
+	return (mt->ma_flags & MT_FLAGS_HEIGHT_MASK) >> MT_FLAGS_HEIGHT_OFFSET;
+}
+
 void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max);
-#define mt_for_each(__tree, __entry, __index, __max)                \
-	for (__entry = mt_find(__tree, &(__index), __max); __entry; \
-	     __entry = mt_find_after(__tree, &(__index), __max))
 void *mt_find_after(struct maple_tree *mt, unsigned long *index,
 		    unsigned long max);
+void *mt_prev(struct maple_tree *mt, unsigned long index,  unsigned long min);
 void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max);
-void *mt_prev(struct maple_tree *mt, unsigned long index, unsigned long min);
 
-// Takes ma_lock internally:
-//  * mtree_store()
-//  * mtree_store_range()
-//  * mtree_insert()
-//  * mtree_insert_range()
-//  * mtree_erase()
-//  * mtree_destroy()
-//  * mt_set_in_rcu()
-//  * mt_clear_in_rcu()
+/**
+ * mt_for_each - Iterate over each entry starting at index until max.
+ * @__tree: The Maple Tree
+ * @__entry: The current entry
+ * @__index: The index to update to track the location in the tree
+ * @__max: The maximum limit for @index
+ *
+ * Note: Will not return the zero entry.
+ */
+#define mt_for_each(__tree, __entry, __index, __max) \
+	for (__entry = mt_find(__tree, &(__index), __max); \
+		__entry; __entry = mt_find_after(__tree, &(__index), __max))
 
-int mtree_store_range(struct maple_tree *mt, unsigned long first,
-		      unsigned long last, void *entry);
-int mtree_store(struct maple_tree *mt, unsigned long index, void *entry);
-int mtree_insert(struct maple_tree *mt, unsigned long index, void *entry);
-int mtree_insert_range(struct maple_tree *mt, unsigned long first,
-		       unsigned long last, void *entry);
-void *mtree_erase(struct maple_tree *mt, unsigned long index);
-void mtree_destroy(struct maple_tree *mt);
-bool mas_nomem(struct ma_state *mas);
-bool mas_is_err(struct ma_state *mas);
+
